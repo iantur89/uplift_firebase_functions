@@ -1,6 +1,7 @@
 const functions = require('firebase-functions'); // 1st gen import
 const admin = require('firebase-admin');
 const { OpenAI } = require('openai');
+const { v4: uuidv4 } = require('uuid');
 
 admin.initializeApp();
 
@@ -35,22 +36,61 @@ exports.analyzeMessageEvent = functions.firestore
       .get();
     const plans = plansSnapshot.docs.map(doc => doc.data());
 
-    // LLM Prompt
+    // LLM Prompt (optimized)
     const prompt = `
-      SYSTEM: You help fitness coaches track progress from client messages.
-      Given recent messages and the client's plan, determine if the most recent message implies any completed tactic or measurable change.
+SYSTEM: You help fitness coaches track progress from client messages.
+Given recent messages and the client's plan, determine if the most recent message implies any completed tactic or measurable change.
 
-      MESSAGES (latest first): ${JSON.stringify(recentMessages)}
-      CLIENT PLAN: ${JSON.stringify(plans)}
+MESSAGES (latest first): ${JSON.stringify(recentMessages)}
+CLIENT PLAN: ${JSON.stringify(plans)}
 
-      Provide concise, human-readable instructions for updating the plan. If there's nothing relevant, say "No relevant progress identified."
+If the message implies a plan update, provide:
+- A concise, human-readable instruction for the coach (description)
+- An API call (method, path, body) for the plan change, following the REST API documented below.
 
-      RESPOND IN JSON FORMAT:
-      {
-        "actionRequired": true|false,
-        "description": "<instruction or summary>"
-      }
-    `;
+If there's nothing relevant, say "No relevant progress identified." and set api_call to null.
+
+REST API DOCS (for plan updates):
+
+1. Mark Tactic Completion
+POST /plans/{planId}/tactics/{tacticId}/completions
+Body:
+{
+  "timestamp": "2025-07-03T18:00:00Z",
+  "sourceEvent": "event_uuid"
+}
+
+2. Log Measurement
+POST /plans/{planId}/measurements/{measurementId}/logs
+Body:
+{
+  "date": "2025-07-05",
+  "value": 210,
+  "sourceEvent": "event_uuid"
+}
+
+3. Update Plan Metadata (optional)
+PUT /plans/{planId}
+Body:
+{
+  "title": "Updated Plan Title",
+  "start_date": "2025-07-01",
+  "end_date": "2025-09-23"
+}
+
+Only suggest an API call if the message clearly implies a plan update, tactic completion, or measurement log.
+
+RESPOND IN JSON FORMAT:
+{
+  "actionRequired": true|false,
+  "description": "<instruction or summary>",
+  "api_call": {
+    "method": "POST",
+    "path": "/plans/{planId}/tactics/{tacticId}/completions",
+    "body": { ... }
+  } | null
+}
+`;
 
     const response = await openai.chat.completions.create({
       model: 'gpt-4-turbo',
@@ -67,14 +107,21 @@ exports.analyzeMessageEvent = functions.firestore
 
     // Create new event ~10ms after the original
     const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
+    const activity_id = uuidv4();
 
-    await admin.firestore().collection(`clients2/${clientId}/events`).add({
+    const newEvent = {
       type: "plan_update_suggestion",
       content: analysis.description,
       inbound: false,
       time: newEventTime.toISOString(),
-      relatedEventId: eventId
-    });
+      relatedEventId: eventId,
+      activity_id
+    };
+    if (analysis.api_call) {
+      newEvent.api_call = analysis.api_call;
+    }
 
-    console.log("Created suggestion event.");
+    await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
+
+    console.log("Created plan_update_suggestion event.");
   });
