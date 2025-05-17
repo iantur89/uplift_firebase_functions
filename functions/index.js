@@ -36,7 +36,7 @@ exports.analyzeMessageEvent = functions.firestore
       .get();
     const plans = plansSnapshot.docs.map(doc => doc.data());
 
-    // LLM Prompt (optimized)
+    // LLM Prompt (updated for RESTful path and payload)
     const prompt = `
 SYSTEM: You help fitness coaches track progress from client messages.
 Given recent messages and the client's plan, determine if the most recent message implies any completed tactic or measurable change.
@@ -46,14 +46,15 @@ CLIENT PLAN: ${JSON.stringify(plans)}
 
 If the message implies a plan update, provide:
 - A concise, human-readable instruction for the coach (description)
-- An API call (method, path, body) for the plan change, following the REST API documented below.
+- The full REST API path (including userId and planId) for the plan change, following the API documented below.
+- The JSON payload (body) for the API call, as a separate key.
 
 If there's nothing relevant, say "No relevant progress identified." and set api_call to null.
 
 REST API DOCS (for plan updates):
 
 1. Mark Tactic Completion
-POST /plans/{planId}/tactics/{tacticId}/completions
+POST /clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions
 Body:
 {
   "timestamp": "2025-07-03T18:00:00Z",
@@ -61,7 +62,7 @@ Body:
 }
 
 2. Log Measurement
-POST /plans/{planId}/measurements/{measurementId}/logs
+POST /clients2/{userId}/plans/{planId}/measurements/{measurementId}/logs
 Body:
 {
   "date": "2025-07-05",
@@ -70,7 +71,7 @@ Body:
 }
 
 3. Update Plan Metadata (optional)
-PUT /plans/{planId}
+PUT /clients2/{userId}/plans/{planId}
 Body:
 {
   "title": "Updated Plan Title",
@@ -84,12 +85,16 @@ RESPOND IN JSON FORMAT:
 {
   "actionRequired": true|false,
   "description": "<instruction or summary>",
+  "api_path": "/clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions",
+  "api_payload": { ... },
   "api_call": {
     "method": "POST",
-    "path": "/plans/{planId}/tactics/{tacticId}/completions",
+    "path": "/clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions",
     "body": { ... }
   } | null
 }
+
+Make sure api_path and api_payload are always present and correct if actionRequired is true.
 `;
 
     const response = await openai.chat.completions.create({
@@ -98,30 +103,68 @@ RESPOND IN JSON FORMAT:
       response_format: { type: "json_object" },
     });
 
-    const analysis = JSON.parse(response.choices[0].message.content);
+    let analysis;
+    try {
+      analysis = JSON.parse(response.choices[0].message.content);
+    } catch (err) {
+      console.error("Failed to parse LLM response:", response.choices[0].message.content);
+      throw err;
+    }
+
+    // Validate LLM response
+    let apiPath = null;
+    let apiPayload = null;
+    let apiCall = null;
+    let isValid = true;
+    let validationError = null;
+    if (analysis.actionRequired) {
+      apiPath = analysis.api_path || (analysis.api_call && analysis.api_call.path);
+      apiPayload = analysis.api_payload || (analysis.api_call && analysis.api_call.body);
+      apiCall = analysis.api_call;
+      // Check that apiPath includes userId and planId
+      if (!apiPath || !apiPath.includes(clientId) || !apiPath.includes('plans')) {
+        isValid = false;
+        validationError = `api_path missing or does not include userId/planId: ${apiPath}`;
+        console.error(validationError);
+      }
+      // Check that apiPayload is an object
+      if (!apiPayload || typeof apiPayload !== 'object') {
+        isValid = false;
+        validationError = `api_payload missing or not an object: ${apiPayload}`;
+        console.error(validationError);
+      }
+    }
 
     if (!analysis.actionRequired) {
       console.log("No relevant action identified.");
       return null;
     }
 
-    // Create new event ~10ms after the original
-    const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
-    const activity_id = uuidv4();
+    // Only create a new event if there was a clear action and the LLM response is valid
+    if (analysis.actionRequired && isValid) {
+      // Create new event ~10ms after the original
+      const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
+      const activity_id = uuidv4();
 
-    const newEvent = {
-      type: "plan_update_suggestion",
-      content: analysis.description,
-      inbound: false,
-      time: newEventTime.toISOString(),
-      relatedEventId: eventId,
-      activity_id
-    };
-    if (analysis.api_call) {
-      newEvent.api_call = analysis.api_call;
+      const newEvent = {
+        type: "plan_update_suggestion",
+        content: analysis.description,
+        inbound: false,
+        time: newEventTime.toISOString(),
+        relatedEventId: eventId,
+        activity_id,
+        api_path: apiPath,
+        api_payload: apiPayload,
+        api_call: apiCall,
+        llm_response_valid: isValid,
+        llm_validation_error: validationError
+      };
+
+      await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
+      console.log("Created plan_update_suggestion event.");
+      return newEvent;
+    } else {
+      console.log("No clear action or invalid LLM response. No event created.");
+      return null;
     }
-
-    await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
-
-    console.log("Created plan_update_suggestion event.");
   });

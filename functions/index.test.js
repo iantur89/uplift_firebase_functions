@@ -26,9 +26,14 @@ jest.mock('openai', () => ({
               content: JSON.stringify({
                 actionRequired: true,
                 description: "Client completed their workout",
+                api_path: "/clients2/client123/plans/plan-123/tactics/workout/completions",
+                api_payload: {
+                  timestamp: "2024-03-20T10:00:00Z",
+                  sourceEvent: "event-123"
+                },
                 api_call: {
                   method: "POST",
-                  path: "/plans/plan-123/tactics/workout/completions",
+                  path: "/clients2/client123/plans/plan-123/tactics/workout/completions",
                   body: {
                     timestamp: "2024-03-20T10:00:00Z",
                     sourceEvent: "event-123"
