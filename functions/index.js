@@ -2,18 +2,203 @@ const functions = require('firebase-functions'); // 1st gen import
 const admin = require('firebase-admin');
 const { OpenAI } = require('openai');
 const { v4: uuidv4 } = require('uuid');
-
 admin.initializeApp();
 
 const openai = new OpenAI({ 
-  apiKey: functions.config().openai.api_key 
+  apiKey: (functions.config().openai && functions.config().openai.api_key) || process.env.OPENAI_API_KEY
 });
+
+const db = admin.firestore();
+
+// Helper: Get user profile
+async function getUserProfile(userId) {
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+  const userRef = db.collection('clients2').doc(userId);
+  const doc = await userRef.get();
+  if (!doc.exists) {
+    return null;
+  }
+  return doc.data().profile;
+}
+
+// Helper: Get summary for user
+async function getSummaryForUser(userId) {
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+  const userRef = db.collection('clients2').doc(userId);
+  const doc = await userRef.get();
+  if (!doc.exists) {
+    return null;
+  }
+  return doc.data().summary;
+}
+
+// Helper: Get plan for user
+async function getPlanForUser(userId) {
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+  const plansRef = db.collection('clients2').doc(userId).collection('plans');
+  const snapshot = await plansRef.orderBy('start_date', 'desc').limit(1).get();
+  if (snapshot.empty) {
+    return null;
+  }
+  return snapshot.docs[0].data();
+}
+
+// Helper: Get events for user
+async function getEventsForUser(userId, limit) {
+  if (!userId) {
+    throw new Error('userId is required');
+  }
+  const eventsRef = db.collection('clients2').doc(userId).collection('events');
+  let query = eventsRef.orderBy('time', 'desc');
+  if (limit) {
+    query = query.limit(limit);
+  }
+  const snapshot = await query.get();
+  return snapshot.docs.map(doc => doc.data());
+}
+
+// Helper: Draft message using OpenAI Assistant API
+async function draftMessage({ situation, audience = "neutral", tone = "neutral" }) {
+  try {
+    const thread = await openai.beta.threads.create();
+    const content = `Situation: ${situation}\nAudience: ${audience}\nTone: ${tone}`;
+    await openai.beta.threads.messages.create(thread.id, {
+      role: "user",
+      content
+    });
+    const run = await openai.beta.threads.runs.create(thread.id, {
+      assistant_id: functions.config().openai.assistant_id
+    });
+
+    let runStatus;
+    let attempts = 0;
+    const maxAttempts = 20;
+    do {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      runStatus = await openai.beta.threads.runs.retrieve(thread.id, run.id);
+      attempts++;
+    } while (
+      (runStatus.status === 'queued' || runStatus.status === 'in_progress') &&
+      attempts < maxAttempts
+    );
+
+    if (runStatus.status === 'completed') {
+      const messages = await openai.beta.threads.messages.list(thread.id);
+      const lastMsg = messages.data.reverse().find(m => m.role === 'assistant');
+      return lastMsg?.content[0]?.text?.value || '';
+    } else {
+      throw new Error('OpenAI run failed: ' + (runStatus.last_error?.message || runStatus.status));
+    }
+  } catch (err) {
+    throw err;
+  }
+}
+
+// Helper: Generate coach message
+async function generateCoachMessage({ userId, toneParam }) {
+  // Fetch all required data
+  const [profile, summary, plan, events] = await Promise.all([
+    getUserProfile(userId),
+    getSummaryForUser(userId),
+    getPlanForUser(userId),
+    getEventsForUser(userId)
+  ]);
+
+  // Prepare event snippets (last 3 events, most recent first)
+  const last3Events = (events || []).slice(0, 3).map(e =>
+    `[${e.timestamp || e.time}] ${e.type || ''}: ${e.content || e.body || ''}`
+  ).join('\n');
+
+  // Prepare plan snapshot (goals and tactics)
+  let planSnapshot = '';
+  if (plan && plan.goals) {
+    planSnapshot = plan.goals.map(goal =>
+      `Goal: ${goal.title}\nTactics: ${goal.tactics.map(t => t.title).join(', ')}`
+    ).join('\n');
+  }
+
+  const audience = profile.clientName || 'client';
+  const coachingStyle = profile.coachingStyle || '';
+  const tone = coachingStyle + (toneParam ? ` ${toneParam}` : '');
+  const randomWordCount = Math.floor(Math.random() * (35 - 15 + 1)) + 15;
+  const situation = `
+SYSTEM: You are CoachGPT, a personal training assistant. Based on the client's profile, current plan, recent events, and their FSM state, draft a message. Always prioritize replying if the last message was inbound from the client. Otherwise, act proactively based on their state.
+
+CONTEXT:
+CLIENT NAME: ${profile.clientName}
+STYLE: ${profile.coachingStyle}
+GOAL: ${profile.goal}
+STATE: ${summary.Status}
+SUMMARY: ${summary.Summary}
+LAST 3 EVENTS:
+${last3Events}
+
+PLAN SNAPSHOT:
+${planSnapshot}
+
+RULES:
+- If latest message was inbound, draft a warm, relevant reply (no matter the FSM state).
+- If proactive, follow the logic:
+
+  → STATE: Onboarding
+     • Nudge client to complete plan setup (goals, preferences, schedule).
+     • Ask about missing info with a helpful tone.
+
+  → STATE: Engaged
+     • Keep momentum high but low-pressure.
+     • Highlight wins, praise consistency, suggest minor challenges.
+
+  → STATE: At Risk
+     • Gently flag missed activity or low check-in rate.
+     • Offer support or simplification. Ask what's been hard.
+
+  → STATE: Renewal
+     • Nudge client to book a 1:1 to plan next phase.
+     • Remind them how far they've come, and suggest a goal reset.
+
+TONE GUIDE: Use the client's coachingStyle to shape the voice.
+- Therapist: curious, patient, reflective
+- Cheerleader: energetic, supportive, informal
+- Analyst: precise, neutral, results-focused
+- DrillSergeant: crisp, motivating, directive
+
+INSTRUCTION:
+Draft a message (${randomWordCount} words max) based on the above.
+`;
+
+  const draftRaw = await draftMessage({ situation, audience, tone });
+  let draft = draftRaw;
+  // Remove markdown code block if present
+  let cleaned = draftRaw;
+  if (typeof cleaned === 'string') {
+    cleaned = cleaned.replace(/^```[a-zA-Z]*\n/, '').replace(/```\s*$/, '').trim();
+  }
+  // Parse as JSON and return only the draft field
+  try {
+    const parsed = JSON.parse(cleaned);
+    if (parsed && typeof parsed === 'object' && parsed.draft) {
+      draft = parsed.draft;
+    } else {
+      draft = cleaned;
+    }
+  } catch (e) {
+    draft = cleaned;
+  }
+  return draft;
+}
 
 exports.analyzeMessageEvent = functions.firestore
   .document('clients2/{clientId}/events/{eventId}')
   .onCreate(async (snap, context) => {
     const { clientId, eventId } = context.params;
     const eventData = snap.data();
+    let createdEvents = [];
 
     console.log(`[analyzeMessageEvent] Triggered for clientId: ${clientId}, eventId: ${eventId}`);
     console.log('[analyzeMessageEvent] eventData:', JSON.stringify(eventData));
@@ -21,7 +206,7 @@ exports.analyzeMessageEvent = functions.firestore
     // Skip if it's not an inbound message
     if (eventData.type !== "message" || eventData.inbound === false) {
       console.log("Not an inbound client message. Skipping.");
-      return null;
+      return createdEvents;
     }
 
     // Fetch last 5 events
@@ -165,7 +350,6 @@ Make sure api_path and api_payload are always present and correct if actionRequi
 
       if (!analysis.actionRequired) {
         console.log("No relevant action identified.");
-        return null;
       }
 
       // Only create a new event if there was a clear action and the LLM response is valid
@@ -191,45 +375,16 @@ Make sure api_path and api_payload are always present and correct if actionRequi
         console.log('[analyzeMessageEvent] Creating plan_update_suggestion event:', JSON.stringify(newEvent));
         await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
         console.log("Created plan_update_suggestion event.");
-        return newEvent;
+        createdEvents.push(newEvent);
       } else {
         console.log("No clear action or invalid LLM response. No event created.");
-        return null;
       }
     }
 
     // --- 2. Draft Reply Suggestion ---
-    // Compose LLM prompt for draft reply
-    const draftReplyPrompt = `
-SYSTEM: You help fitness coaches draft replies to client messages.
-Given the most recent inbound message, provide a draft reply.
-
-MESSAGE: ${JSON.stringify(recentMessages[0])}
-
-RESPOND IN JSON FORMAT:
-{
-  "content": "<draft reply content>"
-}
-`;
-
-    console.log('[analyzeMessageEvent] LLM prompt:', draftReplyPrompt);
-
-    const draftReplyResponse = await openai.chat.completions.create({
-      model: 'gpt-4-turbo',
-      messages: [{ role: 'system', content: draftReplyPrompt }],
-      response_format: { type: "json_object" },
-    });
-
-    console.log('[analyzeMessageEvent] LLM raw response:', JSON.stringify(draftReplyResponse));
-
-    let draftReply;
-    try {
-      draftReply = JSON.parse(draftReplyResponse.choices[0].message.content);
-      console.log('[analyzeMessageEvent] Parsed LLM draft reply:', JSON.stringify(draftReply));
-    } catch (err) {
-      console.error("Failed to parse LLM response:", draftReplyResponse.choices[0].message.content);
-      throw err;
-    }
+    // Use generateCoachMessage from helpers
+    const draftReply = await generateCoachMessage({ userId: clientId, toneParam: "" });
+    console.log('[analyzeMessageEvent] Generated draft reply:', draftReply);
 
     // Delete any existing draft_reply_suggestion events for this client
     const draftReplyEventsSnap = await admin.firestore()
@@ -243,13 +398,13 @@ RESPOND IN JSON FORMAT:
     // Add new draft_reply_suggestion event
     const newDraftReplyEvent = {
       type: "draft_reply_suggestion",
-      content: draftReply.content,
+      content: draftReply,
       inbound: false,
       time: new Date().toISOString(),
       relatedEventId: eventId,
       activity_id: uuidv4(),
     };
     await admin.firestore().collection(`clients2/${clientId}/events`).add(newDraftReplyEvent);
-
-    return null;
+    createdEvents.push(newDraftReplyEvent);
+    return createdEvents;
   });
