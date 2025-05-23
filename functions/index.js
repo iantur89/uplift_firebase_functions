@@ -15,6 +15,9 @@ exports.analyzeMessageEvent = functions.firestore
     const { clientId, eventId } = context.params;
     const eventData = snap.data();
 
+    console.log(`[analyzeMessageEvent] Triggered for clientId: ${clientId}, eventId: ${eventId}`);
+    console.log('[analyzeMessageEvent] eventData:', JSON.stringify(eventData));
+
     // Skip if it's not an inbound message
     if (eventData.type !== "message" || eventData.inbound === false) {
       console.log("Not an inbound client message. Skipping.");
@@ -29,15 +32,35 @@ exports.analyzeMessageEvent = functions.firestore
       .get();
 
     const recentMessages = recentMessagesSnapshot.docs.map(doc => doc.data());
+    console.log('[analyzeMessageEvent] recentMessages:', JSON.stringify(recentMessages));
 
     // Fetch plan data
     const plansSnapshot = await admin.firestore()
       .collection(`clients2/${clientId}/plans`)
       .get();
     const plans = plansSnapshot.docs.map(doc => doc.data());
+    console.log('[analyzeMessageEvent] plans:', JSON.stringify(plans));
 
-    // LLM Prompt (updated for RESTful path and payload)
-    const prompt = `
+    // Find the current plan
+    const now = new Date();
+    let currentPlan = null;
+    for (const plan of plans) {
+      if (plan.start_date && plan.end_date) {
+        const start = new Date(plan.start_date);
+        const end = new Date(plan.end_date);
+        if (now >= start && now <= end) {
+          currentPlan = plan;
+          break;
+        }
+      }
+    }
+    const planId = currentPlan ? currentPlan.planId : null;
+    console.log('[analyzeMessageEvent] current planId:', planId);
+
+    // --- 1. Plan Update Analysis ---
+    if (planId) {
+      // LLM Prompt (updated for RESTful path and payload)
+      const planUpdatePrompt = `
 SYSTEM: You help fitness coaches track progress from client messages.
 Given recent messages and the client's plan, determine if the most recent message implies any completed tactic or measurable change.
 
@@ -97,74 +120,136 @@ RESPOND IN JSON FORMAT:
 Make sure api_path and api_payload are always present and correct if actionRequired is true.
 `;
 
-    const response = await openai.chat.completions.create({
+      console.log('[analyzeMessageEvent] LLM prompt:', planUpdatePrompt);
+
+      const planUpdateResponse = await openai.chat.completions.create({
+        model: 'gpt-4-turbo',
+        messages: [{ role: 'system', content: planUpdatePrompt }],
+        response_format: { type: "json_object" },
+      });
+
+      console.log('[analyzeMessageEvent] LLM raw response:', JSON.stringify(planUpdateResponse));
+
+      let analysis;
+      try {
+        analysis = JSON.parse(planUpdateResponse.choices[0].message.content);
+        console.log('[analyzeMessageEvent] Parsed LLM analysis:', JSON.stringify(analysis));
+      } catch (err) {
+        console.error("Failed to parse LLM response:", planUpdateResponse.choices[0].message.content);
+        throw err;
+      }
+
+      // Validate LLM response
+      let apiPath = null;
+      let apiPayload = null;
+      let apiCall = null;
+      let isValid = true;
+      let validationError = null;
+      if (analysis.actionRequired) {
+        apiPath = analysis.api_path || (analysis.api_call && analysis.api_call.path);
+        apiPayload = analysis.api_payload || (analysis.api_call && analysis.api_call.body);
+        apiCall = analysis.api_call;
+        // Check that apiPath includes userId and planId
+        if (!apiPath || !apiPath.includes(clientId) || !apiPath.includes(planId)) {
+          isValid = false;
+          validationError = `api_path missing or does not include userId/planId: ${apiPath}`;
+          console.error(validationError);
+        }
+        // Check that apiPayload is an object
+        if (!apiPayload || typeof apiPayload !== 'object') {
+          isValid = false;
+          validationError = `api_payload missing or not an object: ${apiPayload}`;
+          console.error(validationError);
+        }
+      }
+
+      if (!analysis.actionRequired) {
+        console.log("No relevant action identified.");
+        return null;
+      }
+
+      // Only create a new event if there was a clear action and the LLM response is valid
+      if (analysis.actionRequired) {
+        // Create new event ~10ms after the original
+        const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
+        const activity_id = uuidv4();
+
+        const newEvent = {
+          type: "plan_update_suggestion",
+          content: analysis.description,
+          inbound: false,
+          time: newEventTime.toISOString(),
+          relatedEventId: eventId,
+          activity_id,
+          api_path: apiPath,
+          api_payload: apiPayload,
+          api_call: apiCall,
+          llm_response_valid: isValid,
+          llm_validation_error: validationError
+        };
+
+        console.log('[analyzeMessageEvent] Creating plan_update_suggestion event:', JSON.stringify(newEvent));
+        await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
+        console.log("Created plan_update_suggestion event.");
+        return newEvent;
+      } else {
+        console.log("No clear action or invalid LLM response. No event created.");
+        return null;
+      }
+    }
+
+    // --- 2. Draft Reply Suggestion ---
+    // Compose LLM prompt for draft reply
+    const draftReplyPrompt = `
+SYSTEM: You help fitness coaches draft replies to client messages.
+Given the most recent inbound message, provide a draft reply.
+
+MESSAGE: ${JSON.stringify(recentMessages[0])}
+
+RESPOND IN JSON FORMAT:
+{
+  "content": "<draft reply content>"
+}
+`;
+
+    console.log('[analyzeMessageEvent] LLM prompt:', draftReplyPrompt);
+
+    const draftReplyResponse = await openai.chat.completions.create({
       model: 'gpt-4-turbo',
-      messages: [{ role: 'system', content: prompt }],
+      messages: [{ role: 'system', content: draftReplyPrompt }],
       response_format: { type: "json_object" },
     });
 
-    let analysis;
+    console.log('[analyzeMessageEvent] LLM raw response:', JSON.stringify(draftReplyResponse));
+
+    let draftReply;
     try {
-      analysis = JSON.parse(response.choices[0].message.content);
+      draftReply = JSON.parse(draftReplyResponse.choices[0].message.content);
+      console.log('[analyzeMessageEvent] Parsed LLM draft reply:', JSON.stringify(draftReply));
     } catch (err) {
-      console.error("Failed to parse LLM response:", response.choices[0].message.content);
+      console.error("Failed to parse LLM response:", draftReplyResponse.choices[0].message.content);
       throw err;
     }
 
-    // Validate LLM response
-    let apiPath = null;
-    let apiPayload = null;
-    let apiCall = null;
-    let isValid = true;
-    let validationError = null;
-    if (analysis.actionRequired) {
-      apiPath = analysis.api_path || (analysis.api_call && analysis.api_call.path);
-      apiPayload = analysis.api_payload || (analysis.api_call && analysis.api_call.body);
-      apiCall = analysis.api_call;
-      // Check that apiPath includes userId and planId
-      if (!apiPath || !apiPath.includes(clientId) || !apiPath.includes('plans')) {
-        isValid = false;
-        validationError = `api_path missing or does not include userId/planId: ${apiPath}`;
-        console.error(validationError);
-      }
-      // Check that apiPayload is an object
-      if (!apiPayload || typeof apiPayload !== 'object') {
-        isValid = false;
-        validationError = `api_payload missing or not an object: ${apiPayload}`;
-        console.error(validationError);
-      }
-    }
+    // Delete any existing draft_reply_suggestion events for this client
+    const draftReplyEventsSnap = await admin.firestore()
+      .collection(`clients2/${clientId}/events`)
+      .where('type', '==', 'draft_reply_suggestion')
+      .get();
+    const batch = admin.firestore().batch();
+    draftReplyEventsSnap.forEach(doc => batch.delete(doc.ref));
+    await batch.commit();
 
-    if (!analysis.actionRequired) {
-      console.log("No relevant action identified.");
-      return null;
-    }
+    // Add new draft_reply_suggestion event
+    const newDraftReplyEvent = {
+      type: "draft_reply_suggestion",
+      content: draftReply.content,
+      inbound: false,
+      time: new Date().toISOString(),
+      relatedEventId: eventId,
+      activity_id: uuidv4(),
+    };
+    await admin.firestore().collection(`clients2/${clientId}/events`).add(newDraftReplyEvent);
 
-    // Only create a new event if there was a clear action and the LLM response is valid
-    if (analysis.actionRequired && isValid) {
-      // Create new event ~10ms after the original
-      const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
-      const activity_id = uuidv4();
-
-      const newEvent = {
-        type: "plan_update_suggestion",
-        content: analysis.description,
-        inbound: false,
-        time: newEventTime.toISOString(),
-        relatedEventId: eventId,
-        activity_id,
-        api_path: apiPath,
-        api_payload: apiPayload,
-        api_call: apiCall,
-        llm_response_valid: isValid,
-        llm_validation_error: validationError
-      };
-
-      await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
-      console.log("Created plan_update_suggestion event.");
-      return newEvent;
-    } else {
-      console.log("No clear action or invalid LLM response. No event created.");
-      return null;
-    }
+    return null;
   });
