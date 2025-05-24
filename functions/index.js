@@ -244,13 +244,73 @@ exports.analyzeMessageEvent = functions.firestore
 
     // --- 1. Plan Update Analysis ---
     if (planId) {
-      // LLM Prompt (updated for RESTful path and payload)
-      const planUpdatePrompt = `
+      // Only do plan analysis if the plan has tactics and measurements with completions and recordings arrays (empty or otherwise)
+      const hasProgressAndMeasurements = currentPlan && Array.isArray(currentPlan.goals) && currentPlan.goals.some(goal =>
+        (Array.isArray(goal.tactics) && goal.tactics.some(t => Array.isArray(t.completions))) &&
+        (Array.isArray(goal.measurements) && goal.measurements.some(m => Array.isArray(m.recordings)))
+      );
+      if (hasProgressAndMeasurements) {
+        // Prepare a concise plan summary for the LLM prompt
+        const planGoalsSummary = (currentPlan.goals || []).map((goal, idx) => {
+          const tactics = (goal.tactics || []).map(t => `    - ${t.title} [${t.frequency}]`).join('\n');
+          const measurements = (goal.measurements || []).map(m => `    - ${m.title} (${m.unit}, start: ${m.start}, goal: ${m.goal})`).join('\n');
+          return `Goal ${idx + 1}: ${goal.title}\n  Tactics:\n${tactics}\n  Measurements:\n${measurements}`;
+        }).join('\n\n');
+
+        // LLM Prompt (updated for RESTful path and payload)
+        const planUpdatePrompt = `
 SYSTEM: You help fitness coaches track progress from client messages.
 Given recent messages and the client's plan, determine if the most recent message implies any completed tactic or measurable change.
 
 MESSAGES (latest first): ${JSON.stringify(recentMessages)}
-CLIENT PLAN: ${JSON.stringify(plans)}
+CLIENT PLAN GOALS, TACTICS, MEASUREMENTS:\n${planGoalsSummary}
+
+EXAMPLES:
+
+If the plan has these goals and tactics:
+- Goal: "Lose 10 lbs"
+  - Tactic: "Do 4 workouts per week"
+  - Tactic: "Log your food daily"
+- Goal: "Reduce stress"
+  - Measurement: "Meditate 500 minutes in total"
+
+And the following messages are received:
+- "I just got home from my workout!"
+- "Here are my macros for today"
+- "Finished my meditation, 10 mins this time!"
+
+You might generate these events:
+
+// Tactic completion example
+{
+  "actionRequired": true,
+  "description": "Add a completion for tactic \"Do 4 workouts per week\" in goal \"Lose 10 lbs\"",
+  "api_call": {
+    "method": "POST",
+    "path": "/clients2/12345/plans/ABC/goals/lose_10_lbs/tactics/Do_4_workouts_per_week/completions",
+    "body": {
+      "timestamp": "YYYY-MM-DDThh:mm:ssZ",
+      "sourceEvent": "<relatedEventId>"
+    }
+  }
+}
+
+// Measurement log example
+{
+  "actionRequired": true,
+  "description": "Add a recording of 10 to measurement \"Meditate 500 minutes in total\" in goal \"Reduce stress\"",
+  "api_call": {
+    "method": "POST",
+    "path": "/clients2/12345/plans/ABC/goals/reduce_stress/measurements/meditate_500_minutes_in_total/logs",
+    "body": {
+      "timestamp": "YYYY-MM-DDThh:mm:ssZ",
+      "value": 10,
+      "sourceEvent": "<relatedEventId>"
+    }
+  }
+}
+
+If the message does not clearly imply a plan update, return actionRequired: false and api_call: null.
 
 If the message implies a plan update, provide:
 - A concise, human-readable instruction for the coach (description)
@@ -266,7 +326,7 @@ POST /clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions
 Body:
 {
   "timestamp": "2025-07-03T18:00:00Z",
-  "sourceEvent": "event_uuid"
+  "sourceEvent": "event id"
 }
 
 2. Log Measurement
@@ -275,16 +335,7 @@ Body:
 {
   "date": "2025-07-05",
   "value": 210,
-  "sourceEvent": "event_uuid"
-}
-
-3. Update Plan Metadata (optional)
-PUT /clients2/{userId}/plans/{planId}
-Body:
-{
-  "title": "Updated Plan Title",
-  "start_date": "2025-07-01",
-  "end_date": "2025-09-23"
+  "sourceEvent": "event id"
 }
 
 Only suggest an API call if the message clearly implies a plan update, tactic completion, or measurement log.
@@ -293,8 +344,6 @@ RESPOND IN JSON FORMAT:
 {
   "actionRequired": true|false,
   "description": "<instruction or summary>",
-  "api_path": "/clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions",
-  "api_payload": { ... },
   "api_call": {
     "method": "POST",
     "path": "/clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions",
@@ -302,82 +351,84 @@ RESPOND IN JSON FORMAT:
   } | null
 }
 
-Make sure api_path and api_payload are always present and correct if actionRequired is true.
+- Only include the api_call object (do not repeat the payload or path elsewhere).
+- For sourceEvent, always use the event document ID (provided as relatedEventId), not the activity_id.
+
+Make sure api_call is always present and correct if actionRequired is true.
 `;
 
-      console.log('[analyzeMessageEvent] LLM prompt:', planUpdatePrompt);
+        console.log('[analyzeMessageEvent] LLM prompt:', planUpdatePrompt);
 
-      const planUpdateResponse = await openai.chat.completions.create({
-        model: 'gpt-4-turbo',
-        messages: [{ role: 'system', content: planUpdatePrompt }],
-        response_format: { type: "json_object" },
-      });
+        const planUpdateResponse = await openai.chat.completions.create({
+          model: 'gpt-4-turbo',
+          messages: [{ role: 'system', content: planUpdatePrompt }],
+          response_format: { type: "json_object" },
+        });
 
-      console.log('[analyzeMessageEvent] LLM raw response:', JSON.stringify(planUpdateResponse));
+        console.log('[analyzeMessageEvent] LLM raw response:', JSON.stringify(planUpdateResponse));
 
-      let analysis;
-      try {
-        analysis = JSON.parse(planUpdateResponse.choices[0].message.content);
-        console.log('[analyzeMessageEvent] Parsed LLM analysis:', JSON.stringify(analysis));
-      } catch (err) {
-        console.error("Failed to parse LLM response:", planUpdateResponse.choices[0].message.content);
-        throw err;
-      }
-
-      // Validate LLM response
-      let apiPath = null;
-      let apiPayload = null;
-      let apiCall = null;
-      let isValid = true;
-      let validationError = null;
-      if (analysis.actionRequired) {
-        apiPath = analysis.api_path || (analysis.api_call && analysis.api_call.path);
-        apiPayload = analysis.api_payload || (analysis.api_call && analysis.api_call.body);
-        apiCall = analysis.api_call;
-        // Check that apiPath includes userId and planId
-        if (!apiPath || !apiPath.includes(clientId) || !apiPath.includes(planId)) {
-          isValid = false;
-          validationError = `api_path missing or does not include userId/planId: ${apiPath}`;
-          console.error(validationError);
+        let analysis;
+        try {
+          analysis = JSON.parse(planUpdateResponse.choices[0].message.content);
+          console.log('[analyzeMessageEvent] Parsed LLM analysis:', JSON.stringify(analysis));
+        } catch (err) {
+          console.error("Failed to parse LLM response:", planUpdateResponse.choices[0].message.content);
+          throw err;
         }
-        // Check that apiPayload is an object
-        if (!apiPayload || typeof apiPayload !== 'object') {
-          isValid = false;
-          validationError = `api_payload missing or not an object: ${apiPayload}`;
-          console.error(validationError);
+
+        // Validate LLM response
+        let apiPath = null;
+        let apiPayload = null;
+        let apiCall = null;
+        let isValid = true;
+        let validationError = null;
+        if (analysis.actionRequired) {
+          apiPath = analysis.api_path || (analysis.api_call && analysis.api_call.path);
+          apiPayload = analysis.api_payload || (analysis.api_call && analysis.api_call.body);
+          apiCall = analysis.api_call;
+          // Check that apiPath includes userId and planId
+          if (!apiPath || !apiPath.includes(clientId) || !apiPath.includes(planId)) {
+            isValid = false;
+            validationError = `api_path missing or does not include userId/planId: ${apiPath}`;
+            console.error(validationError);
+          }
+          // Check that apiPayload is an object
+          if (!apiPayload || typeof apiPayload !== 'object') {
+            isValid = false;
+            validationError = `api_payload missing or not an object: ${apiPayload}`;
+            console.error(validationError);
+          }
         }
-      }
 
-      if (!analysis.actionRequired) {
-        console.log("No relevant action identified.");
-      }
+        if (!analysis.actionRequired) {
+          console.log("No relevant action identified.");
+        }
 
-      // Only create a new event if there was a clear action and the LLM response is valid
-      if (analysis.actionRequired) {
-        // Create new event ~10ms after the original
-        const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
-        const activity_id = uuidv4();
+        // Only create a new event if there was a clear action and the LLM response is valid
+        if (analysis.actionRequired) {
+          // Create new event ~10ms after the original
+          const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
+          const activity_id = uuidv4();
 
-        const newEvent = {
-          type: "plan_update_suggestion",
-          content: analysis.description,
-          inbound: false,
-          time: newEventTime.toISOString(),
-          relatedEventId: eventId,
-          activity_id,
-          api_path: apiPath,
-          api_payload: apiPayload,
-          api_call: apiCall,
-          llm_response_valid: isValid,
-          llm_validation_error: validationError
-        };
+          const newEvent = {
+            type: "plan_update_suggestion",
+            content: analysis.description,
+            inbound: false,
+            time: newEventTime.toISOString(),
+            relatedEventId: eventId,
+            activity_id,
+            api_call: apiCall,
+            llm_response_valid: isValid,
+            llm_validation_error: validationError
+          };
 
-        console.log('[analyzeMessageEvent] Creating plan_update_suggestion event:', JSON.stringify(newEvent));
-        await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
-        console.log("Created plan_update_suggestion event.");
-        createdEvents.push(newEvent);
-      } else {
-        console.log("No clear action or invalid LLM response. No event created.");
+          console.log('[analyzeMessageEvent] Creating plan_update_suggestion event:', JSON.stringify(newEvent));
+          await admin.firestore().collection(`clients2/${clientId}/events`).add(newEvent);
+          console.log("Created plan_update_suggestion event.");
+          createdEvents.push(newEvent);
+        } else {
+          console.log("No clear action or invalid LLM response. No event created.");
+        }
       }
     }
 
