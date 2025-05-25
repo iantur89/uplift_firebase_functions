@@ -259,10 +259,10 @@ exports.analyzeMessageEvent = functions.firestore
 
         // LLM Prompt (updated for RESTful path and payload)
         const planUpdatePrompt = `
-SYSTEM: You help fitness coaches track progress from client messages.
-Given recent messages and the client's plan, determine if the most recent message implies any completed tactic or measurable change.
+      SYSTEM: You help fitness coaches track progress from client messages.
+      Given recent messages and the client's plan, determine if the most recent message implies any completed tactic or measurable change.
 
-MESSAGES (latest first): ${JSON.stringify(recentMessages)}
+      MESSAGES (latest first): ${JSON.stringify(recentMessages)}
 CLIENT PLAN GOALS, TACTICS, MEASUREMENTS:\n${planGoalsSummary}
 
 EXAMPLES:
@@ -342,9 +342,9 @@ Body:
 
 Only suggest an API call if the message clearly implies a plan update, tactic completion, or measurement log.
 
-RESPOND IN JSON FORMAT:
-{
-  "actionRequired": true|false,
+      RESPOND IN JSON FORMAT:
+      {
+        "actionRequired": true|false,
   "description": "Add a recording of <value> to measurement \"<measurement_title>>\" in goal \"<goal_title>\" | Add a completion to tactic \"<tactic_title>\" in goal \"<goal_title>\"",
   "api_call": {
     "method": "POST",
@@ -362,10 +362,10 @@ Make sure api_call is always present and correct if actionRequired is true.
         console.log('[analyzeMessageEvent] LLM prompt:', planUpdatePrompt);
 
         const planUpdateResponse = await openai.chat.completions.create({
-          model: 'gpt-4-turbo',
+      model: 'gpt-4-turbo',
           messages: [{ role: 'system', content: planUpdatePrompt }],
-          response_format: { type: "json_object" },
-        });
+      response_format: { type: "json_object" },
+    });
 
         console.log('[analyzeMessageEvent] LLM raw response:', JSON.stringify(planUpdateResponse));
 
@@ -376,6 +376,15 @@ Make sure api_call is always present and correct if actionRequired is true.
         } catch (err) {
           console.error("Failed to parse LLM response:", planUpdateResponse.choices[0].message.content);
           throw err;
+        }
+
+        // Inject actual userId and planId into api_call.path if present
+        if (analysis.api_call && analysis.api_call.path) {
+          console.log('[PlanUpdateSuggestionEvent] BEFORE path:', analysis.api_call.path);
+          analysis.api_call.path = analysis.api_call.path
+            .replace(/{userId}/gi, encodeURIComponent(clientId))
+            .replace(/{planId}/gi, planId);
+          console.log('[PlanUpdateSuggestionEvent] AFTER path:', analysis.api_call.path);
         }
 
         // Validate LLM response
@@ -402,6 +411,12 @@ Make sure api_call is always present and correct if actionRequired is true.
           }
           // Enhanced validation: check goal/tactic/measurement existence
           if (apiCall && apiCall.path) {
+            // Ensure path contains both clientId and planId
+            if (!apiCall.path.includes(clientId) || !apiCall.path.includes(planId)) {
+              isValid = false;
+              validationError = `api_call.path missing clientId or planId after replacement: ${apiCall.path}`;
+              console.error(validationError);
+            }
             // Extract goal, tactic, measurement from path
             const goalMatch = apiCall.path.match(/goals\/([^/]+)/);
             const tacticMatch = apiCall.path.match(/tactics\/([^/]+)/);
@@ -437,21 +452,21 @@ Make sure api_call is always present and correct if actionRequired is true.
           }
         }
 
-        if (!analysis.actionRequired) {
-          console.log("No relevant action identified.");
-        }
+    if (!analysis.actionRequired) {
+      console.log("No relevant action identified.");
+    }
 
         // Only create a new event if there was a clear action and the LLM response is valid
         if (analysis.actionRequired) {
-          // Create new event ~10ms after the original
-          const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
+    // Create new event ~10ms after the original
+    const newEventTime = new Date(new Date(eventData.time).getTime() + 10);
           const activity_id = uuidv4();
 
           const newEvent = {
-            type: "plan_update_suggestion",
-            content: analysis.description,
-            inbound: false,
-            time: newEventTime.toISOString(),
+      type: "plan_update_suggestion",
+      content: analysis.description,
+      inbound: false,
+      time: newEventTime.toISOString(),
             relatedEventId: eventId,
             activity_id,
             api_call: apiCall,
