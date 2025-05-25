@@ -267,6 +267,8 @@ CLIENT PLAN GOALS, TACTICS, MEASUREMENTS:\n${planGoalsSummary}
 
 EXAMPLES:
 
+(assume user id 12345 and plan id ABC)
+
 If the plan has these goals and tactics:
 - Goal: "Lose 10 lbs"
   - Tactic: "Do 4 workouts per week"
@@ -322,7 +324,7 @@ If there's nothing relevant, say "No relevant progress identified." and set api_
 REST API DOCS (for plan updates):
 
 1. Mark Tactic Completion
-POST /clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions
+POST /clients2/{userId}/plans/{planId}/goals/{goal_title_with_underscores}/tactics/{tactic_title_with_underscores}/completions
 Body:
 {
   "timestamp": "2025-07-03T18:00:00Z",
@@ -330,7 +332,7 @@ Body:
 }
 
 2. Log Measurement
-POST /clients2/{userId}/plans/{planId}/measurements/{measurementId}/logs
+POST /clients2/{userId}/plans/{planId}/goals/{goal_title_with_underscore}/measurements/{masurement_title_with_underscore}/logs
 Body:
 {
   "date": "2025-07-05",
@@ -343,10 +345,10 @@ Only suggest an API call if the message clearly implies a plan update, tactic co
 RESPOND IN JSON FORMAT:
 {
   "actionRequired": true|false,
-  "description": "<instruction or summary>",
+  "description": "Add a recording of <value> to measurement \"<measurement_title>>\" in goal \"<goal_title>\" | Add a completion to tactic \"<tactic_title>\" in goal \"<goal_title>\"",
   "api_call": {
     "method": "POST",
-    "path": "/clients2/{userId}/plans/{planId}/tactics/{tacticId}/completions",
+    "path": "/clients2/{userId}/plans/{planId}/goals/{goal_title_with_underscore}/measurements/{measurement_title_with_underscore}/logs | /clients2/{userId}/plans/{planId}/goals/{goal_title_with_underscores}/tactics/{tactic_title_with_underscores}/completions",
     "body": { ... }
   } | null
 }
@@ -397,6 +399,41 @@ Make sure api_call is always present and correct if actionRequired is true.
             isValid = false;
             validationError = `api_payload missing or not an object: ${apiPayload}`;
             console.error(validationError);
+          }
+          // Enhanced validation: check goal/tactic/measurement existence
+          if (apiCall && apiCall.path) {
+            // Extract goal, tactic, measurement from path
+            const goalMatch = apiCall.path.match(/goals\/([^/]+)/);
+            const tacticMatch = apiCall.path.match(/tactics\/([^/]+)/);
+            const measurementMatch = apiCall.path.match(/measurements\/([^/]+)/);
+            const goalTitle = goalMatch ? goalMatch[1].replace(/_/g, ' ') : null;
+            const tacticTitle = tacticMatch ? tacticMatch[1].replace(/_/g, ' ') : null;
+            const measurementTitle = measurementMatch ? measurementMatch[1].replace(/_/g, ' ') : null;
+            let foundGoal = null;
+            if (goalTitle && Array.isArray(currentPlan.goals)) {
+              foundGoal = currentPlan.goals.find(g => g.title.toLowerCase() === goalTitle.toLowerCase());
+              if (!foundGoal) {
+                isValid = false;
+                validationError = `Goal title not found in plan: ${goalTitle}`;
+                console.error(validationError);
+              }
+            }
+            if (foundGoal && tacticTitle) {
+              const foundTactic = (foundGoal.tactics || []).find(t => t.title.toLowerCase() === tacticTitle.toLowerCase());
+              if (!foundTactic) {
+                isValid = false;
+                validationError = `Tactic title not found in goal '${goalTitle}': ${tacticTitle}`;
+                console.error(validationError);
+              }
+            }
+            if (foundGoal && measurementTitle) {
+              const foundMeasurement = (foundGoal.measurements || []).find(m => m.title.toLowerCase() === measurementTitle.toLowerCase());
+              if (!foundMeasurement) {
+                isValid = false;
+                validationError = `Measurement title not found in goal '${goalTitle}': ${measurementTitle}`;
+                console.error(validationError);
+              }
+            }
           }
         }
 
